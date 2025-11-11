@@ -4,7 +4,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-
+#include <numa.h>
+#include <numaif.h>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -179,9 +180,13 @@ absl::Status MemAccess::Run() {
 
   LOG(INFO) << "sleep for " << sleep_time_ << " seconds";
   absl::SleepFor(absl::Seconds(sleep_time_));
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 10; i++) {
     LOG(INFO) << "start round: " << i;
-    ret = MemAccessExec(std::move(run_task_), std::to_string(i + 1), false);
+    auto new_task = std::make_unique<MemAccessTask>(*run_task_);
+    if (i % 2 == 1) {
+        std::reverse(new_task->order_.begin(), new_task->order_.end());
+    }
+    ret = MemAccessExec(std::move(new_task), std::to_string(i + 1), false);
     if (ret.ok()) {
       run_task_ = std::move(ret.value());
     } else {
@@ -280,7 +285,20 @@ absl::Status MemAccess::Setup() {
   warmup_task_ = std::move(warmup);
   run_task_ = std::move(run);
   if (anon_) {
-    if (posix_memalign(&heap_, kPageSize, (max_block + 1) << kPageShift) != 0) {
+	  /*size_t heap_size = (max_block + 1) << kPageShift;
+	  int res = posix_memalign(&heap_, kPageSize, (max_block + 1) << kPageShift);
+    if (res != 0) {
+      auto err_message =
+          absl::StrFormat("%s, requesting %d Bytes", strerror(errno),
+                          (max_block + 1) << kPageShift);
+      return absl::InvalidArgumentError("allocate heap size:" + err_message);
+    };
+    unsigned long nodemask = 1UL << 1;  // node1
+    int ret = mbind(heap_, heap_size, MPOL_BIND, &nodemask, sizeof(nodemask)*8, 0);
+    if (ret < 0) {
+        perror("mbind failed");
+    }*/
+if (posix_memalign(&heap_, kPageSize, (max_block + 1) << kPageShift) != 0) {
       auto err_message =
           absl::StrFormat("%s, requesting %d Bytes", strerror(errno),
                           (max_block + 1) << kPageShift);
@@ -311,11 +329,11 @@ absl::Status MemAccess::Setup() {
   LOG(INFO) << "heap addr: " << (void *)heap_;
   LOG(INFO) << "sleep for " << sleep_time_ << " seconds between tests";
   if (work_type_ == 0) {
-    LOG(INFO) << "workload: write whole page";
+    LOG(INFO) << "workload: write intensive";
   } else if (work_type_ == 1) {
     LOG(INFO) << "workload: write first 64-bit number per page";
   } else if (work_type_ == 2) {
-    LOG(INFO) << "workload: read the whole page";
+    LOG(INFO) << "workload: read intensive";
   } else if (work_type_ == 3) {
     LOG(INFO) << "workload: write time stamp in the whole page then check "
                  "correctness";
@@ -323,6 +341,8 @@ absl::Status MemAccess::Setup() {
     LOG(INFO)
         << "workload: write time stamp in the whole working set then check "
            "correctness";
+  } else if (work_type_ == 5){
+	LOG(INFO) << "workload: mixed read/write";
   }
   memset(heap_, 0, (max_block + 1) << kPageShift);
 
@@ -364,9 +384,9 @@ MemAccess::MemAccessExec(std::unique_ptr<MemAccessTask> task,
                          absl::string_view task_desc, bool warm_with_write) {
   std::string result;
 
-  uint64_t start_tick, end_tick, mseconds;
+  uint64_t start_tick, end_tick, mseconds, cxl_read ,cxl_write,dram_read, dram_write;
   char read_buf[kPageSize];
-
+	
   result.append("-----------start-----------\n");
 
   auto st = GetTppCounter(result, "start_");
@@ -382,19 +402,49 @@ MemAccess::MemAccessExec(std::unique_ptr<MemAccessTask> task,
       *tmp = start_tick;
     }
   }
+  size_t idx = 0;
+  cxl_read = 0;
+  cxl_write = 0;
+  dram_read = 0;
+  dram_write = 0;
   for (auto &i : task->order_) {
     void *page_addr = (void *)((uint64_t)task->heap_addr_ + (i << kPageShift));
+    int node = -1;
+    get_mempolicy(&node, NULL, 0, (void*)page_addr, MPOL_F_NODE | MPOL_F_ADDR);
     if (warm_with_write) {
       memcpy(page_addr, read_buf, kPageSize);
     } else {
-      if (work_type_ == 0) {
-        memcpy(page_addr, read_buf, kPageSize);
+      if (work_type_ == 0) {//write intensive
+	      if (i % 4 != 0) {
+                        memcpy(page_addr, read_buf, kPageSize);  // write
+                        if(node == 1)
+                                cxl_write++;
+                        else if(node == 0)
+                                dram_write++;
+                } else {
+                        memcpy(read_buf, page_addr, kPageSize);  // read
+                        if(node == 1)
+                                cxl_read++;
+                        else if(node == 0)
+                                dram_read++;
+                }
       } else if (work_type_ == 1) {
         char *ptr = (char *)page_addr;
         *ptr = 0;
-      } else if (work_type_ == 2) {
-        memcpy(read_buf, page_addr, kPageSize);
-        // memcmp(page_addr, read_buf, kPageSize);
+      } else if (work_type_ == 2) {//read_intensive
+	      if (i % 4 == 0) {
+                        memcpy(page_addr, read_buf, kPageSize);  // write
+                        if(node == 1)
+                                cxl_write++;
+                        else if(node == 0)
+                                dram_write++;
+                } else {
+                        memcpy(read_buf, page_addr, kPageSize);  // read
+                        if(node == 1)
+                                cxl_read++;
+                        else if(node == 0)
+                                dram_read++;
+                }
       } else if (work_type_ == 3) {
         uint64_t unique_tsc = rdtsc();
 
@@ -421,6 +471,22 @@ MemAccess::MemAccessExec(std::unique_ptr<MemAccessTask> task,
           *tmp = start_tick;
         };
       }
+      else if (work_type_ == 5) {
+    		if (i % 2 == 0) {
+      			memcpy(page_addr, read_buf, kPageSize);  // write
+			if(node == 1)
+				cxl_write++;
+			else if(node == 0)
+				dram_write++;
+    		} else {
+      			memcpy(read_buf, page_addr, kPageSize);  // read
+			if(node == 1)
+				cxl_read++;
+			else if(node == 0)
+				dram_read++;
+    		}
+	}
+
     }
   }
   if (work_type_ == 4) {
@@ -456,10 +522,18 @@ MemAccess::MemAccessExec(std::unique_ptr<MemAccessTask> task,
   result.append(
       absl::StrFormat(kLogFormatDec, "total tick", end_tick - start_tick));
   result.append(absl::StrFormat(kLogFormatDec, "work type", work_type_));
-  if (work_type_ == 0 || work_type_ == 2) {
+  if (work_type_ == 0 || work_type_ == 2 || work_type_ == 5) {
     result.append(absl::StrFormat(
-        kLogFormatFLoat, "Bandwidth(MB/s)",
+        kLogFormatFLoat, "Overall Bandwidth(MB/s)",
         task->order_.size() * kPageSize / 1024.0 / 1024 / mseconds * 1000.0));
+    result.append(absl::StrFormat(
+        kLogFormatFLoat, "CXL Read", cxl_read));
+    result.append(absl::StrFormat(
+        kLogFormatFLoat, "CXL WRITE", cxl_write));
+    result.append(absl::StrFormat(
+        kLogFormatFLoat, "DRAM Read", dram_read));
+    result.append(absl::StrFormat(
+        kLogFormatFLoat, "DRAM WRITE", dram_write));
   } else if (work_type_ == 1) {
     uint64_t nseconds = absl::ToInt64Nanoseconds(dur);
     result.append(absl::StrFormat(kLogFormatFLoat, "avg latency(ns)",

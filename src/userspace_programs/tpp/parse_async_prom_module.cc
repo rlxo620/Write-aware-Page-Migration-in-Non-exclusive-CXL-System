@@ -111,8 +111,6 @@ absl::Status ModParser::AppendModInfo(std::string &output,
         absl::StrFormat(kLogFormatDec, std::string(note) + "try_to_promote_nr",
                         buffer.try_to_promote_nr);
 
-    output += absl::StrFormat(kLogFormatDec, std::string(note) + "task_num",
-                              buffer.task_num);
     output += absl::StrFormat(kLogFormatDec,
                               std::string(note) + "write_protect_break_num",
                               buffer.wp_num);
@@ -133,6 +131,8 @@ absl::Status ModParser::AppendModInfo(std::string &output,
         buffer.transactional_migration_fail);
     output += absl::StrFormat(
         kLogFormatDec, std::string(note) + "shadow_page_pair", buffer.kv_num);
+    output += absl::StrFormat(kLogFormatDec, std::string(note) + "failed_write_intensive_page",
+          buffer.task_num);
     return absl::OkStatus();
   }
   return absl::InvalidArgumentError("invalid op");

@@ -26,7 +26,7 @@
 #define OUTPUT_BUF_LEN 4096
 #define DEVICE_NAME "async_prom"
 #define WORK_DELAY (msecs_to_jiffies(0))
-
+#define THRESHOLD 300
 #define PROMOTE_QUEUE_LEN (1ULL << 9)
 
 #define INTERACTION_BUFFER_SIZE (PAGE_SIZE)
@@ -160,7 +160,7 @@ static struct device *test_device;
 static struct page_fault_decision_context fault_decision_context;
 
 static struct shadow_page_dev mapping_dev;
-
+static int hash[1024];
 // record the status for how the user program access the module, what we want
 // the module to do and the progress of the access, we assume there is only one
 // process accessing the module.
@@ -169,10 +169,10 @@ static struct shadow_page_dev mapping_dev;
 // 1. should we migrate it?
 // 2. should we set it as accessed?
 // 3. don't do anything
-static int decide_queue_page(struct page *page, pte_t *ptep, int target_nid)
+static int decide_queue_page(struct page *page, pte_t *ptep, int target_nid, int intensive)
 {
 	struct pg_fault_tasks *new_task, *task, *tmp;
-	int idx = -1, err = 0;
+	int idx = -1, err = 0, check = 0;
 	if (target_nid < 0) {
 		goto out;
 	}
@@ -208,18 +208,17 @@ static int decide_queue_page(struct page *page, pte_t *ptep, int target_nid)
 
 		if (pte_young(entry) && PageActive(task->page)) {
 			// queue page for promotion
-			get_page(task->page);
-			queue_pages_for_promotion(task->page, task->target_nid);
-			list_del(&task->head);
-			kmem_cache_free(
+				get_page(task->page);
+				queue_pages_for_promotion(task->page, task->target_nid);
+				list_del(&task->head);
+				kmem_cache_free(
 				fault_decision_context.fault_task_allocator,
 				task);
 			continue;
 		}
 
 		if (pte_young(entry) && !PageActive(task->page)) {
-			// remove bit
-			mark_page_accessed(task->page);
+				mark_page_accessed(task->page);
 			// TODO(lingfeng): right now we don't change the bit
 			// in case that it's not a page table entry. Maybe we can do that
 			// let's set it as a future work for now
@@ -233,8 +232,24 @@ static int decide_queue_page(struct page *page, pte_t *ptep, int target_nid)
 				task);
 		}
 	}
-	list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
+	int idxs = page_to_pfn(page) & 0x3FF;  // 0x3FF == 1023
+	//list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
+	if(pte_check_intensive(*ptep) == 0)
+		list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
+	else if(pte_check_intensive(*ptep) == 1 && hash[idxs] >= THRESHOLD){
+		list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
+		
+	}
+	else{
+		hash[idxs]++;
+		check = 1;
+	}
 	spin_unlock(&fault_decision_context.lock);
+	if (check == 1){
+		spin_lock(&context.info_lock);
+        	context.task_num += 1;
+		spin_unlock(&context.info_lock);
+	}
 out:
 	return err;
 }
@@ -451,7 +466,8 @@ demote_shadow_page_find(struct page *page,
 	get_page(page);
 	contxt->shadow_page = shadow_page;
 	spin_unlock(&mapping_dev.lock);
-
+	//if (shadow_page == NULL)
+		//contxt->dirty = 1;
 	atomic64_fetch_inc(&mapping_dev.demote_find_counter);
 out:
 
@@ -993,7 +1009,9 @@ static void destroy_decision_cache(struct page_fault_decision_context *context)
 // return 0 on success, negative value when fails
 static int init_promotion_context(struct promote_context *prom_context)
 {
-	int ret = 0;
+	int i = 0, ret = 0;
+	for (i = 0; i < 1024; i++)
+		hash[i] = 0;
 	init_rwsem(&prom_context->stop_lock);
 	prom_context->stop_receiving_requests = false;
 	prom_context->task_num = 0;

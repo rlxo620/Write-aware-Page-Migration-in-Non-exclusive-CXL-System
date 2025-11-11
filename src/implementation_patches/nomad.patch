@@ -348,7 +348,7 @@ index 000000000..559df8cad
 +     * @brief return the number of pages to be queued, if should not queue, return 0
 +     * 
 +     */
-+	int (*queue_page_fault)(struct page *page, pte_t *ptep, int target_nid);
++	int (*queue_page_fault)(struct page *page, pte_t *ptep, int target_nid, int intensive);
 +
 +	int (*link_shadow_page)(struct page *newpage, struct page *oldpage);
 +	struct page *(*demote_shadow_page_find)(
@@ -372,7 +372,7 @@ new file mode 100644
 index 000000000..f3bba0803
 --- /dev/null
 +++ b/src/linux-5.13-rc6/include/linux/nomad2.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,96 @@
 +#ifndef _LINUX_NOMAD2_H
 +#define _LINUX_NOMAD2_H
 +
@@ -380,6 +380,10 @@ index 000000000..f3bba0803
 +
 +#define _PAGE_BIT_ORIGINALLY_WRITABLE 52 /* used for non-exclusive mapping */
 +#define _PAGE_ORIGINALLY_WRITABLE	(_AT(u64, 1) << _PAGE_BIT_ORIGINALLY_WRITABLE)
++#define _PAGE_BIT_CHECK_INTENSIVE 53 
++#define _PAGE_CHECK_INTENSIVE      (_AT(u64, 1) << _PAGE_BIT_CHECK_INTENSIVE)
++#define _PAGE_BIT_CHECK_INTENSIVE2 54 
++#define _PAGE_CHECK_INTENSIVE2      (_AT(u64, 1) << _PAGE_BIT_CHECK_INTENSIVE2)
 +
 +static inline int pte_orig_writable(pte_t pte)
 +{
@@ -396,6 +400,36 @@ index 000000000..f3bba0803
 +	return pte_clear_flags(pte, _PAGE_ORIGINALLY_WRITABLE);
 +}
 +
++static inline int pte_check_intensive(pte_t pte)
++{
++       return (native_pte_val(pte) & _PAGE_CHECK_INTENSIVE) != 0;
++}
++
++static inline pte_t pte_mk_check_intensive(pte_t pte)
++{
++       return pte_set_flags(pte, _PAGE_CHECK_INTENSIVE);
++}
++
++static inline pte_t pte_clear_check_intensive(pte_t pte)
++{
++       return pte_clear_flags(pte, _PAGE_CHECK_INTENSIVE);
++}
++
++static inline int pte_check_intensive2(pte_t pte)
++{
++       return (native_pte_val(pte) & _PAGE_CHECK_INTENSIVE2) != 0;
++}
++
++static inline pte_t pte_mk_check_intensive2(pte_t pte)
++{
++       return pte_set_flags(pte, _PAGE_CHECK_INTENSIVE2);
++}
++
++static inline pte_t pte_clear_check_intensive2(pte_t pte)
++{
++       return pte_clear_flags(pte, _PAGE_CHECK_INTENSIVE2);
++}
++
 +#else
 +
 +#error L5 must be turnef off
@@ -404,10 +438,10 @@ index 000000000..f3bba0803
 +
 +// used for shadow page demotion context
 +struct demote_shadow_page_context{
-+	// should we use shadow page? 1 for yes, 0 for no
++	int dirty;
 +	int use_shadow_page;
-+	// If we find one, increment this number by one. If shadow page is
-+	// destroyed, then decrement by one. This is used for checking correctness.
++	int intensive1;
++	int intensive2;
 +	int shadow_page_ref_num;
 +	int traversed_mapping_num;
 +	void *flags;
@@ -1201,6 +1235,10 @@ index f3ffab9b9..19a7319ef 100644
  }
  
  static vm_fault_t do_numa_page(struct vm_fault *vmf)
+@@ -4150,2 +4204,2 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
+	int flags = 0;
+-
++	int was_intensive = pte_check_intensive(vmf->orig_pte); int was_intensive2 = pte_check_intensive2(vmf->orig_pte);
 @@ -4193,8 +4247,30 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
  
  	last_cpupid = page_cpupid_last(page);
@@ -1215,7 +1253,7 @@ index f3ffab9b9..19a7319ef 100644
 +			flags |= TNF_FAULT_LOCAL;
 +		}
 +		nid = mpol_misplaced(page, vma, vmf->address, flags);
-+		async_mod_glob_ctrl.queue_page_fault(page, vmf->pte, nid);
++		async_mod_glob_ctrl.queue_page_fault(page, vmf->pte, nid, was_intensive);
 +		goto out_map;
 +	}
 +
@@ -1242,7 +1280,15 @@ index f3ffab9b9..19a7319ef 100644
  out:
  	if (page_nid != NUMA_NO_NODE)
  		task_numa_fault(last_cpupid, page_nid, 1, flags);
-@@ -4313,7 +4388,8 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
+@@ -4231,3 +4306,7 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
+	if (was_writable)
+		pte = pte_mkwrite(pte);
++	if (was_intensive) pte = pte_mk_check_intensive(pte);
++	
++	if (was_intensive2) pte = pte_mk_check_intensive2(pte); 
++	
+	ptep_modify_prot_commit(vma, vmf->address, vmf->pte, old_pte, pte);
+@@ -4313,7 +4392,8 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
   * The mmap_lock may have been released depending on flags and our return value.
   * See filemap_fault() and __lock_page_or_retry().
   */
@@ -1252,7 +1298,7 @@ index f3ffab9b9..19a7319ef 100644
  {
  	pte_t entry;
  
-@@ -4373,10 +4449,13 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+@@ -4373,10 +4453,13 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
  
  	if (!pte_present(vmf->orig_pte))
  		return do_swap_page(vmf);
@@ -1268,7 +1314,7 @@ index f3ffab9b9..19a7319ef 100644
  	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
  	spin_lock(vmf->ptl);
  	entry = vmf->orig_pte;
-@@ -4432,7 +4511,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+@@ -4432,7 +4515,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
  	pgd_t *pgd;
  	p4d_t *p4d;
  	vm_fault_t ret;
@@ -1476,7 +1522,7 @@ index b234c3f3a..ee780f39b 100644
  
  #include <asm/tlbflush.h>
  
-@@ -167,7 +170,103 @@ void putback_movable_pages(struct list_head *l)
+@@ -167,7 +170,123 @@ void putback_movable_pages(struct list_head *l)
  		}
  	}
  }
@@ -1497,7 +1543,7 @@ index b234c3f3a..ee780f39b 100644
 +	swp_entry_t entry;
 +
 +	VM_BUG_ON_PAGE(PageTail(page), page);
-+	while (page_vma_mapped_walk(&pvmw)) {
++	while (page_vma_mapped_walk(&pvmw)) { 
 +		if (PageKsm(page))
 +			new = page;
 +		else
@@ -1556,10 +1602,30 @@ index b234c3f3a..ee780f39b 100644
 +				if (writable ||
 +				    contxt->was_writable_before_shadowed)
 +					pte = pte_mk_savedwrite(pte);
++				if (!contxt->was_writable_before_shadowed) { 
++					if (contxt->intensive1 == 0 && contxt->intensive2 == 0){ 
++						pte = pte_mk_check_intensive(pte);}			
++					else if (contxt->intensive1 == 1 && contxt->intensive2 == 0){ 
++						pte = pte_mk_check_intensive2(pte);
++						pte = pte_clear_check_intensive(pte); 
++					}
++                                       else if (contxt->intensive1 == 0 && contxt->intensive2 == 1) { 
++                                               pte = pte_mk_check_intensive(pte); }
++				}
++				else { 
++					if (contxt->intensive1 == 1 && contxt->intensive2 == 0) { 
++                                               pte = pte_clear_check_intensive(pte); }
++                                       else if (contxt->intensive1 == 0 && contxt->intensive2 == 1){ 
++                                               pte = pte_clear_check_intensive2(pte);
++                                               pte = pte_mk_check_intensive(pte);
++                                       }
++                                       else if (contxt->intensive1 == 1 && contxt->intensive2 == 1){ 
++                                               pte = pte_clear_check_intensive(pte); }
++				}
 +			}
 +#endif
 +			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
-+
++			
 +			if (PageAnon(new))
 +				page_add_anon_rmap(new, vma, pvmw.address, false);
 +			else
@@ -1571,8 +1637,8 @@ index b234c3f3a..ee780f39b 100644
 +		if (PageTransHuge(page) && PageMlocked(page))
 +			clear_page_mlock(page);
 +
-+		/* No need to invalidate - it was non-present before */
 +		update_mmu_cache(vma, pvmw.address, pvmw.pte);
++	
 +	}
  
 +	return true;
@@ -1580,7 +1646,7 @@ index b234c3f3a..ee780f39b 100644
  /*
   * Restore a potential migration pte to a working pte entry
   */
-@@ -236,6 +335,15 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+@@ -236,6 +355,15 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
  		} else
  #endif
  		{
@@ -1596,7 +1662,7 @@ index b234c3f3a..ee780f39b 100644
  			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
  
  			if (PageAnon(new))
-@@ -256,6 +364,19 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+@@ -256,6 +384,19 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
  	return true;
  }
  
@@ -1616,7 +1682,7 @@ index b234c3f3a..ee780f39b 100644
  /*
   * Get rid of all migration entries and replace them by
   * references to the indicated page.
-@@ -377,6 +498,9 @@ int migrate_page_move_mapping(struct address_space *mapping,
+@@ -377,6 +518,9 @@ int migrate_page_move_mapping(struct address_space *mapping,
  	int expected_count = expected_page_refs(mapping, page) + extra_count;
  	int nr = thp_nr_pages(page);
  
@@ -1626,7 +1692,7 @@ index b234c3f3a..ee780f39b 100644
  	if (!mapping) {
  		/* Anonymous page without mapping */
  		if (page_count(page) != expected_count)
-@@ -1136,6 +1260,80 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+@@ -1136,6 +1280,80 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
  	return rc;
  }
  
@@ -1707,7 +1773,7 @@ index b234c3f3a..ee780f39b 100644
  /*
   * Obtain the lock on page, remove all ptes and migrate the page
   * to the newly allocated page in newpage.
-@@ -1170,6 +1368,10 @@ static int unmap_and_move(new_page_t get_new_page,
+@@ -1170,6 +1388,10 @@ static int unmap_and_move(new_page_t get_new_page,
  	if (!newpage)
  		return -ENOMEM;
  
@@ -1718,7 +1784,7 @@ index b234c3f3a..ee780f39b 100644
  	rc = __unmap_and_move(page, newpage, force, mode);
  	if (rc == MIGRATEPAGE_SUCCESS)
  		set_page_owner_migrate_reason(newpage, reason);
-@@ -1391,6 +1593,7 @@ static inline int try_split_thp(struct page *page, struct page **page2,
+@@ -1391,6 +1613,7 @@ static inline int try_split_thp(struct page *page, struct page **page2,
   * @mode:		The migration mode that specifies the constraints for
   *			page migration, if any.
   * @reason:		The reason for page migration.
@@ -1726,7 +1792,7 @@ index b234c3f3a..ee780f39b 100644
   *
   * The function returns after 10 attempts or if no pages are movable any more
   * because the list has become empty or no retryable pages exist any more.
-@@ -1401,12 +1604,11 @@ static inline int try_split_thp(struct page *page, struct page **page2,
+@@ -1401,12 +1624,11 @@ static inline int try_split_thp(struct page *page, struct page **page2,
   */
  int migrate_pages(struct list_head *from, new_page_t get_new_page,
  		free_page_t put_new_page, unsigned long private,
@@ -1740,7 +1806,7 @@ index b234c3f3a..ee780f39b 100644
  	int nr_thp_succeeded = 0;
  	int nr_thp_failed = 0;
  	int nr_thp_split = 0;
-@@ -1500,6 +1702,7 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+@@ -1500,6 +1722,7 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
  					goto out;
  				}
  				nr_failed++;
@@ -1748,7 +1814,7 @@ index b234c3f3a..ee780f39b 100644
  				goto out;
  			case -EAGAIN:
  				if (is_thp) {
-@@ -1511,10 +1714,10 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+@@ -1511,10 +1734,10 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
  			case MIGRATEPAGE_SUCCESS:
  				if (is_thp) {
  					nr_thp_succeeded++;
@@ -1761,7 +1827,7 @@ index b234c3f3a..ee780f39b 100644
  				break;
  			default:
  				/*
-@@ -1543,12 +1746,12 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
+@@ -1543,12 +1766,12 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
  	 */
  	list_splice(&ret_pages, from);
  
@@ -1776,7 +1842,7 @@ index b234c3f3a..ee780f39b 100644
  			       nr_thp_failed, nr_thp_split, mode, reason);
  
  	if (!swapwrite)
-@@ -1616,6 +1819,7 @@ static int store_status(int __user *status, int start, int value, int nr)
+@@ -1616,6 +1839,7 @@ static int store_status(int __user *status, int start, int value, int nr)
  static int do_move_pages_to_node(struct mm_struct *mm,
  		struct list_head *pagelist, int node)
  {
@@ -1784,7 +1850,7 @@ index b234c3f3a..ee780f39b 100644
  	int err;
  	struct migration_target_control mtc = {
  		.nid = node,
-@@ -1623,7 +1827,8 @@ static int do_move_pages_to_node(struct mm_struct *mm,
+@@ -1623,7 +1847,8 @@ static int do_move_pages_to_node(struct mm_struct *mm,
  	};
  
  	err = migrate_pages(pagelist, alloc_migration_target, NULL,
@@ -1794,7 +1860,7 @@ index b234c3f3a..ee780f39b 100644
  	if (err)
  		putback_movable_pages(pagelist);
  	return err;
-@@ -2049,8 +2254,10 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
+@@ -2049,8 +2274,10 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
  	VM_BUG_ON_PAGE(compound_order(page) && !PageTransHuge(page), page);
  
  	/* Avoid migrating to a node that is nearly full */
@@ -1806,7 +1872,7 @@ index b234c3f3a..ee780f39b 100644
  
  	if (isolate_lru_page(page))
  		return 0;
-@@ -2097,6 +2304,8 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+@@ -2097,6 +2324,8 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
  	pg_data_t *pgdat = NODE_DATA(node);
  	int isolated;
  	int nr_remaining;
@@ -1815,7 +1881,7 @@ index b234c3f3a..ee780f39b 100644
  	LIST_HEAD(migratepages);
  
  	/*
-@@ -2107,21 +2316,18 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+@@ -2107,21 +2336,18 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
  	    (vma->vm_flags & VM_EXEC))
  		goto out;
  
@@ -1843,7 +1909,7 @@ index b234c3f3a..ee780f39b 100644
  	if (nr_remaining) {
  		if (!list_empty(&migratepages)) {
  			list_del(&page->lru);
-@@ -2130,8 +2336,13 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+@@ -2130,8 +2356,13 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
  			putback_lru_page(page);
  		}
  		isolated = 0;
@@ -1858,7 +1924,7 @@ index b234c3f3a..ee780f39b 100644
  	BUG_ON(!list_empty(&migratepages));
  	return isolated;
  
-@@ -2139,6 +2350,7 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
+@@ -2139,6 +2370,7 @@ int migrate_misplaced_page(struct page *page, struct vm_area_struct *vma,
  	put_page(page);
  	return 0;
  }
@@ -1866,7 +1932,7 @@ index b234c3f3a..ee780f39b 100644
  #endif /* CONFIG_NUMA_BALANCING */
  
  #if defined(CONFIG_NUMA_BALANCING) && defined(CONFIG_TRANSPARENT_HUGEPAGE)
-@@ -2162,13 +2374,16 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
+@@ -2162,13 +2394,16 @@ int migrate_misplaced_transhuge_page(struct mm_struct *mm,
  	new_page = alloc_pages_node(node,
  		(GFP_TRANSHUGE_LIGHT | __GFP_THISNODE),
  		HPAGE_PMD_ORDER);
@@ -1884,7 +1950,7 @@ index b234c3f3a..ee780f39b 100644
  		goto out_fail;
  	}
  
-@@ -3127,3 +3342,1467 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
+@@ -3127,3 +3362,1467 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
  }
  EXPORT_SYMBOL(migrate_vma_finalize);
  #endif /* CONFIG_DEVICE_PRIVATE */
@@ -3095,8 +3161,8 @@ index b234c3f3a..ee780f39b 100644
 +		.was_writable_before_shadowed = false,
 +		.made_writable = false,
 +		.shadow_page = NULL,
++		.dirty = 0, .intensive1 = 0, .intensive2 = 0,
 +	};
-+
 +	if (!thp_migration_supported() && PageTransHuge(page))
 +		return -ENOSYS;
 +
@@ -3753,11 +3819,11 @@ index 693a610e1..1c2034b90 100644
 +			if (pte_write(pteval)) {
 +				contxt->made_writable = true;
 +			}
-+			/*
-+			 * Store the pfn of the page in a special migration
-+			 * pte. do_swap_page() will wait until the migration
-+			 * pte is removed and then restart fault handling.
-+			 */
++			if (pte_check_intensive(pteval))
++				contxt->intensive1 = 1; 
++			if (pte_check_intensive2(pteval))
++			 	contxt->intensive2 = 1;
++			
 +			entry = make_migration_entry(subpage,
 +					pte_write(pteval));
 +			swp_pte = swp_entry_to_pte(entry);
@@ -3994,10 +4060,10 @@ index 693a610e1..1c2034b90 100644
 +	if (pte_swp_soft_dirty(old_pteval))
 +		new_pteval = pte_mksoft_dirty(new_pteval);
 +
-+	/*
-+	* Recheck VMA as permissions can change since migration started
-+	*/
-+
++	if (pte_check_intensive(old_pteval))
++		new_pteval = pte_mk_check_intensive(new_pteval);
++	if (pte_check_intensive2(old_pteval))
++		new_pteval = pte_mk_check_intensive2(new_pteval);
 +	if (pte_soft_dirty(old_pteval)) {
 +		new_pteval = pte_mksoft_dirty(new_pteval);
 +	}
@@ -4739,6 +4805,10 @@ index 5199b9696..47f85f57c 100644
  
  /*
   * A direct reclaimer may isolate SWAP_CLUSTER_MAX pages from the LRU list and
+@@ -2257,2 +2404,2 @@ 
+ 		if (page_referenced(page, 0, sc->target_mem_cgroup,
+-				    &vm_flags)) {
++				&vm_flags) || PageShadowed(page)) {		
 @@ -2433,6 +2580,7 @@ enum scan_balance {
  static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
  			   unsigned long *nr)
