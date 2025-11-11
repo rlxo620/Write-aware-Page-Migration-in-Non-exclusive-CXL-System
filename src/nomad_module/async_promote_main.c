@@ -26,7 +26,7 @@
 #define OUTPUT_BUF_LEN 4096
 #define DEVICE_NAME "async_prom"
 #define WORK_DELAY (msecs_to_jiffies(0))
-#define THRESHOLD 300
+#define THRESHOLD 2000000000
 #define PROMOTE_QUEUE_LEN (1ULL << 9)
 
 #define INTERACTION_BUFFER_SIZE (PAGE_SIZE)
@@ -151,7 +151,8 @@ queue_pages_for_promotion(struct page *page, int target_nid);
 static struct promote_context context;
 static struct workqueue_struct *wq = NULL;
 static DECLARE_WORK(promote_work, promote_work_handler);
-
+static int increased,promote_count, maxidx, max;
+static unsigned long ratio;
 static int major_num;
 static dev_t devno;
 static struct class *cls;
@@ -232,24 +233,42 @@ static int decide_queue_page(struct page *page, pte_t *ptep, int target_nid, int
 				task);
 		}
 	}
-	int idxs = page_to_pfn(page) & 0x3FF;  // 0x3FF == 1023
-	//list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
+	int idxs;
+	if(page) 
+		idxs = page_to_pfn(page) & 0x3FF;  
+	else 
+		goto out;
 	if(pte_check_intensive(*ptep) == 0)
 		list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
-	else if(pte_check_intensive(*ptep) == 1 && hash[idxs] >= THRESHOLD){
+	else if(pte_check_intensive(*ptep) == 1 && increased && idxs == maxidx){
 		list_add(&new_task->head, &fault_decision_context.prev_fault_pages);
-		
 	}
 	else{
 		hash[idxs]++;
+		if(hash[idxs] > max && maxidx != idxs){
+			max = hash[idxs];
+			maxidx = idxs;
+		}
+		if(hash[idxs] > 2000000000)
+			hash[idxs] = 200000000;
 		check = 1;
 	}
 	spin_unlock(&fault_decision_context.lock);
-	if (check == 1){
-		spin_lock(&context.info_lock);
+
+	spin_lock(&context.info_lock);
+	if (check == 1)
         	context.task_num += 1;
-		spin_unlock(&context.info_lock);
-	}
+        promote_count++;
+        if(promote_count > 1000){
+                promote_count = 0;
+                if(context.task_num * 100 > ratio * context.success_nr)
+                        increased = 1;
+                else
+                        increased = 0;
+		if(context.success_nr > 0)
+                	ratio = context.task_num * 100 / context.success_nr;
+        }
+	spin_unlock(&context.info_lock);
 out:
 	return err;
 }
@@ -1010,6 +1029,11 @@ static void destroy_decision_cache(struct page_fault_decision_context *context)
 static int init_promotion_context(struct promote_context *prom_context)
 {
 	int i = 0, ret = 0;
+	increased = 0;
+	promote_count = 0;
+	ratio = 50;
+	max = 0;
+	maxidx = -1;
 	for (i = 0; i < 1024; i++)
 		hash[i] = 0;
 	init_rwsem(&prom_context->stop_lock);
